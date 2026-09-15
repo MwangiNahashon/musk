@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageFilter
 import os
 import time
 import hashlib
@@ -11,31 +11,35 @@ from cryptography.fernet import Fernet
 MAGIC = b"MUSK"
 HEADER_SIZE = 8  # 4 bytes magic + 4 bytes big-endian length
 
+# --- Adaptive bit-depth thresholds on the blurred 3x3 local variance ---
+# Tune these if you find the encoder is skipping too much or hiding too aggressively.
+VAR_SKIP = 10      # below this: 0 bits (too smooth to hide safely)
+VAR_2BIT = 100     # below this: 1 bit per channel
+VAR_3BIT = 500     # below this: 2 bits per channel; above: 3 bits per channel
 
-# ---------- Crypto / key derivation ----------
 
-def derive_fernet_key(password: str) -> bytes:
-    """SHA-256 of the password, base64-urlsafe encoded for Fernet."""
+# ---------------- key derivation ----------------
+
+def derive_fernet_key(password):
     digest = hashlib.sha256(password.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest)
 
 
-def shuffle_seed(password: str) -> int:
-    """Independent seed so pixel order differs from the encryption key."""
+def shuffle_seed(password):
     return int.from_bytes(
         hashlib.sha256(("seed:" + password).encode("utf-8")).digest()[:8], "big"
     )
 
 
-def pixel_positions(width: int, height: int, password: str):
+def pixel_positions(width, height, password):
     positions = list(range(width * height))
     random.Random(shuffle_seed(password)).shuffle(positions)
     return positions
 
 
-# ---------- Bit helpers ----------
+# ---------------- bit helpers ----------------
 
-def bytes_to_bits(data: bytes):
+def bytes_to_bits(data):
     return [(b >> (7 - i)) & 1 for b in data for i in range(8)]
 
 
@@ -49,80 +53,160 @@ def bits_to_bytes(bits):
     return bytes(out)
 
 
-# ---------- LSB steganography ----------
+# ---------------- texture analysis ----------------
 
-def embed_lsb(img: Image.Image, payload: bytes, password: str) -> Image.Image:
+def compute_variance_map(img):
+    """Per-pixel local variance from a blurred grayscale version.
+
+    Blurring (radius 1) removes our tiny LSB edits, so the encoder and decoder
+    classify every pixel identically. Uses summed-area tables for O(1) per pixel.
+    """
+    blurred = img.convert("L").filter(ImageFilter.GaussianBlur(radius=1))
+    w, h = blurred.size
+    gray = list(blurred.getdata())
+
+    W1 = w + 1
+    integral = [0] * ((h + 1) * W1)
+    integral_sq = [0] * ((h + 1) * W1)
+
+    for y in range(h):
+        row_sum = 0
+        row_sum_sq = 0
+        row_base = (y + 1) * W1
+        prev_base = y * W1
+        gray_base = y * w
+        for x in range(w):
+            v = gray[gray_base + x]
+            row_sum += v
+            row_sum_sq += v * v
+            integral[row_base + x + 1] = integral[prev_base + x + 1] + row_sum
+            integral_sq[row_base + x + 1] = integral_sq[prev_base + x + 1] + row_sum_sq
+
+    var_map = [0.0] * (w * h)
+    for y in range(h):
+        y1 = y - 1 if y > 0 else 0
+        y2 = y + 1 if y < h - 1 else h - 1
+        iy1, iy2 = y1, y2 + 1
+        base_top = iy1 * W1
+        base_bot = iy2 * W1
+        row_base = y * w
+        for x in range(w):
+            x1 = x - 1 if x > 0 else 0
+            x2 = x + 1 if x < w - 1 else w - 1
+            ix1, ix2 = x1, x2 + 1
+            n = (ix2 - ix1) * (iy2 - iy1)
+            s = (integral[base_bot + ix2] - integral[base_bot + ix1]
+                 - integral[base_top + ix2] + integral[base_top + ix1])
+            sq = (integral_sq[base_bot + ix2] - integral_sq[base_bot + ix1]
+                  - integral_sq[base_top + ix2] + integral_sq[base_top + ix1])
+            mean = s / n
+            var_map[row_base + x] = max(0.0, (sq / n) - mean * mean)
+    return var_map
+
+
+def depth_for_variance(var):
+    """Map local variance → number of LSBs to use per channel."""
+    if var < VAR_SKIP:
+        return 0
+    if var < VAR_2BIT:
+        return 1
+    if var < VAR_3BIT:
+        return 2
+    return 3
+
+
+# ---------------- adaptive LSB encode / decode ----------------
+
+def embed_adaptive(img, payload, password):
     img = img.convert("RGB")
-    width, height = img.size
-    total_pixels = width * height
-
-    bits = bytes_to_bits(payload)
-    pixels_needed = (len(bits) + 2) // 3  # 3 bits per pixel
-    if pixels_needed > total_pixels:
-        raise ValueError(
-            f"Message too long for this image. Need {pixels_needed} pixels, "
-            f"but image only has {total_pixels}."
-        )
-
-    positions = pixel_positions(width, height, password)
+    w, h = img.size
+    var_map = compute_variance_map(img)
+    positions = pixel_positions(w, h, password)
     pixels = list(img.getdata())
 
+    bits = bytes_to_bits(payload)
+    total_bits = len(bits)
+
+    # Capacity check
+    capacity = 0
+    for pos in positions:
+        d = depth_for_variance(var_map[pos])
+        if d > 0:
+            capacity += d * 3
+            if capacity >= total_bits:
+                break
+    if capacity < total_bits:
+        raise ValueError(
+            f"Message too long for this image.\n"
+            f"Need {total_bits} bits, but capacity is only {capacity} bits.\n"
+            f"Try a larger or more textured image."
+        )
+
     bit_idx = 0
-    for pos in positions[:pixels_needed]:
+    used_pixels = 0
+    for pos in positions:
+        if bit_idx >= total_bits:
+            break
+        d = depth_for_variance(var_map[pos])
+        if d == 0:
+            continue
         r, g, b = pixels[pos][:3]
         ch = [r, g, b]
         for c in range(3):
-            if bit_idx >= len(bits):
-                break
-            if (ch[c] & 1) != bits[bit_idx]:
-                ch[c] ^= 1  # flip LSB (changes value by +/-1, never overflows)
-            bit_idx += 1
+            for k in range(d):
+                if bit_idx >= total_bits:
+                    break
+                if ((ch[c] >> k) & 1) != bits[bit_idx]:
+                    ch[c] ^= (1 << k)
+                bit_idx += 1
         pixels[pos] = (ch[0], ch[1], ch[2])
+        used_pixels += 1
 
-    out = Image.new("RGB", (width, height))
+    out = Image.new("RGB", (w, h))
     out.putdata(pixels)
-    return out
+    return out, used_pixels
 
 
-def extract_lsb(img: Image.Image, password: str) -> bytes:
+def extract_adaptive(img, password):
     img = img.convert("RGB")
-    width, height = img.size
-    total_pixels = width * height
-    max_bits = total_pixels * 3
-
-    positions = pixel_positions(width, height, password)
+    w, h = img.size
+    var_map = compute_variance_map(img)
+    positions = pixel_positions(w, h, password)
     pixels = list(img.getdata())
 
+    header_bits_needed = HEADER_SIZE * 8  # 64
+    total_needed = None
     bits = []
-    pos_idx = 0
-    header_bits_needed = HEADER_SIZE * 8
 
-    # Read header first
-    while len(bits) < header_bits_needed:
-        r, g, b = pixels[positions[pos_idx]][:3]
-        bits.extend((r & 1, g & 1, b & 1))
-        pos_idx += 1
+    for pos in positions:
+        d = depth_for_variance(var_map[pos])
+        if d == 0:
+            continue
+        r, g, b = pixels[pos][:3]
+        for c in (r, g, b):
+            for k in range(d):
+                bits.append((c >> k) & 1)
 
-    header = bits_to_bytes(bits[:header_bits_needed])
-    if header[:4] != MAGIC:
-        raise ValueError("No hidden message found, or incorrect key.")
+        if total_needed is None and len(bits) >= header_bits_needed:
+            header = bits_to_bytes(bits[:header_bits_needed])
+            if header[:4] != MAGIC:
+                raise ValueError("No hidden message found, or the key is wrong.")
+            length = int.from_bytes(header[4:8], "big")
+            total_needed = header_bits_needed + length * 8
 
-    length = int.from_bytes(header[4:8], "big")
-    total_bits_needed = header_bits_needed + length * 8
-    if total_bits_needed > max_bits:
-        raise ValueError("Corrupted header: message length exceeds image capacity.")
+        if total_needed is not None and len(bits) >= total_needed:
+            break
 
-    # Read rest of payload
-    while len(bits) < total_bits_needed:
-        r, g, b = pixels[positions[pos_idx]][:3]
-        bits.extend((r & 1, g & 1, b & 1))
-        pos_idx += 1
+    if total_needed is None:
+        raise ValueError("Could not find a readable header in the image.")
+    if len(bits) < total_needed:
+        raise ValueError("Image ended before the message was fully read.")
 
-    payload_bits = bits[header_bits_needed:total_bits_needed]
+    payload_bits = bits[header_bits_needed:total_needed]
     return bits_to_bytes(payload_bits)
 
 
-# ---------- GUI ----------
+# ---------------- GUI ----------------
 
 class SteganographyApp:
     def __init__(self, master):
@@ -134,12 +218,10 @@ class SteganographyApp:
         self.setup_ui()
 
     def setup_ui(self):
-        tk.Label(
-            self.master,
-            text="MUSK: YOUR PRIVACY IS OUR PRIORITY",
-            bg="#2f4155", fg="black",
-            font=("Times", 24, "italic", "bold"),
-        ).pack(pady=40)
+        tk.Label(self.master,
+                 text="MUSK: YOUR PRIVACY IS OUR PRIORITY",
+                 bg="#2f4155", fg="black",
+                 font=("Times", 24, "italic", "bold")).pack(pady=40)
 
         frame = tk.Frame(self.master, bg="#2f4155")
         frame.pack(pady=10)
@@ -184,7 +266,6 @@ class EncodeWindow:
                  bg="#2f4155", fg="black",
                  font=("Times", 18, "italic", "bold")).pack(pady=10)
 
-        # --- Image preview ---
         self.image_frame = tk.Frame(self.window, bd=3, bg="#742921",
                                     width=340, height=240, relief=tk.GROOVE)
         self.image_frame.pack(pady=5)
@@ -193,7 +274,6 @@ class EncodeWindow:
                                     text="No image selected", fg="white")
         self.image_label.pack(fill=tk.BOTH, expand=True)
 
-        # --- Message ---
         msg_frame = tk.Frame(self.window, bd=3, bg="white", relief=tk.GROOVE)
         msg_frame.pack(pady=5, padx=10, fill=tk.X)
         tk.Label(msg_frame, text="Enter Message:", bg="white",
@@ -201,7 +281,6 @@ class EncodeWindow:
         self.message_text = tk.Text(msg_frame, width=80, height=8, wrap=tk.WORD)
         self.message_text.pack(padx=5, pady=5, fill=tk.X)
 
-        # --- Key ---
         key_frame = tk.Frame(self.window, bd=3, bg="#07493d", relief=tk.GROOVE)
         key_frame.pack(pady=5, padx=10, fill=tk.X)
         tk.Label(key_frame, text="Secret key (min 8 chars):", bg="#07493d",
@@ -209,7 +288,6 @@ class EncodeWindow:
         self.key_entry = tk.Entry(key_frame, show="*", font=("Times", 12), width=30)
         self.key_entry.grid(row=0, column=1, padx=8, pady=6, sticky="w")
 
-        # --- Stego name ---
         stego_frame = tk.Frame(self.window, bd=3, bg="#07493d", relief=tk.GROOVE)
         stego_frame.pack(pady=5, padx=10, fill=tk.X)
         tk.Label(stego_frame, text="Stego image name:", bg="#07493d",
@@ -218,7 +296,6 @@ class EncodeWindow:
         self.stego_entry.grid(row=0, column=1, padx=8, pady=6, sticky="w")
         self.stego_entry.insert(0, "stego")
 
-        # --- Buttons ---
         btn_frame = tk.Frame(self.window, bg="#2f4155")
         btn_frame.pack(pady=12)
         tk.Button(btn_frame, text="Open Cover Image", width=18, height=2,
@@ -230,8 +307,6 @@ class EncodeWindow:
         tk.Button(btn_frame, text="Back", width=18, height=2,
                   bg="#020024", fg="white", bd=0, font=("Times", 12, "bold"),
                   command=self.window.destroy).pack(side=tk.LEFT, padx=6)
-
-    # ---------- actions ----------
 
     def open_cover_image(self):
         filename = filedialog.askopenfilename(
@@ -273,7 +348,6 @@ class EncodeWindow:
             messagebox.showerror("Error", "Please provide a name for the stego image.")
             return
 
-        # strip any .png the user may have already typed
         if stego_name.lower().endswith(".png"):
             stego_name = stego_name[:-4]
         output_path = os.path.join(os.getcwd(), stego_name + ".png")
@@ -281,17 +355,12 @@ class EncodeWindow:
         try:
             start = time.time()
 
-            # 1. Encrypt
             fernet = Fernet(derive_fernet_key(key))
             ciphertext = fernet.encrypt(message.encode("utf-8"))
 
-            # 2. Build payload = magic + length + ciphertext
             payload = MAGIC + len(ciphertext).to_bytes(4, "big") + ciphertext
 
-            # 3. Embed
-            stego_img = embed_lsb(self.cover_img, payload, key)
-
-            # 4. Save
+            stego_img, used_pixels = embed_adaptive(self.cover_img, payload, key)
             stego_img.save(output_path, "PNG")
 
             elapsed = time.time() - start
@@ -299,6 +368,7 @@ class EncodeWindow:
                 "Success",
                 f"Message encoded and saved to:\n{output_path}\n\n"
                 f"Payload size: {len(ciphertext)} bytes\n"
+                f"Pixels used (adaptive): {used_pixels} of {self.cover_img.width * self.cover_img.height}\n"
                 f"Encoding took {elapsed:.2f}s",
             )
         except Exception as e:
@@ -358,8 +428,6 @@ class DecodeWindow:
         self.output_text = tk.Text(out_frame, width=80, height=8, wrap=tk.WORD)
         self.output_text.pack(padx=5, pady=5, fill=tk.X)
 
-    # ---------- actions ----------
-
     def open_stego_image(self):
         filename = filedialog.askopenfilename(
             initialdir=os.getcwd(),
@@ -393,14 +461,9 @@ class DecodeWindow:
 
         try:
             start = time.time()
+            payload = extract_adaptive(self.stego_img, key)
+            ciphertext = payload  # header already stripped inside extract_adaptive
 
-            # 1. Extract raw payload bytes
-            payload = extract_lsb(self.stego_img, key)
-
-            # 2. Strip header (already validated inside extract_lsb)
-            ciphertext = payload  # extract_lsb returns only the ciphertext body
-
-            # 3. Decrypt
             fernet = Fernet(derive_fernet_key(key))
             message = fernet.decrypt(ciphertext).decode("utf-8")
 
